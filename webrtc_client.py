@@ -9,7 +9,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
-CLIENT_VERSION = "2026-04-30-packed-audio-layout"
+CLIENT_VERSION = "2026-04-30-manual-control"
 
 
 def default_audio_devices():
@@ -50,6 +50,9 @@ def parse_args():
     parser.add_argument("--speaker-device", default=os.getenv("SPEAKER_DEVICE", defaults["speaker_device"]))
     parser.add_argument("--speaker-format", default=os.getenv("SPEAKER_FORMAT", defaults["speaker_format"]))
     parser.add_argument("--speaker-rate", type=int, default=int(os.getenv("SPEAKER_RATE", "48000")))
+    parser.add_argument("--manual-control", action="store_true")
+    parser.add_argument("--toggle-key", default=os.getenv("TOGGLE_KEY", "c"))
+    parser.add_argument("--quit-key", default=os.getenv("QUIT_KEY", "q"))
     parser.add_argument("--verbose-events", action="store_true")
     return parser.parse_args()
 
@@ -283,12 +286,8 @@ class SoundDeviceAudioPlayer:
         return audio
 
 
-async def run():
-    """Conecta micrófono/parlante del cliente con OpenAI Realtime vía WebRTC."""
-    args = parse_args()
-
-    print("Innova WebRTC client version:", CLIENT_VERSION)
-
+def validate_args(args):
+    """Valida argumentos comunes antes de abrir dispositivos o red."""
     if not args.device_token:
         raise RuntimeError("RASPBERRY_DEVICE_TOKEN is required")
 
@@ -299,10 +298,48 @@ async def run():
             '`--mic-device "audio=Exact Microphone Name"`.'
         )
 
+
+def normalize_key(value):
+    """Normaliza nombres simples de teclas para el modo manual."""
+    if value.lower() in {"space", "espacio"}:
+        return " "
+    if value.lower() in {"enter", "return"}:
+        return "\r"
+    return value[:1].lower()
+
+
+def read_key_blocking():
+    """Lee una tecla sin requerir Enter en Windows y terminales POSIX."""
+    if sys.platform.startswith("win"):
+        import msvcrt
+
+        return msvcrt.getwch().lower()
+
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        return sys.stdin.read(1).lower()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+async def read_key():
+    """Lee una tecla sin bloquear el event loop."""
+    return await asyncio.to_thread(read_key_blocking)
+
+
+async def run_connected_session(args, stop_event=None):
+    """Abre una sesión WebRTC y la mantiene viva hasta recibir stop_event."""
+    stop_event = stop_event or asyncio.Event()
     pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[]))
     channel = pc.createDataChannel("oai-events")
     event_logger = RealtimeEventLogger(args.verbose_events)
     session_id = None
+    input_track = None
 
     try:
         player = MediaPlayer(args.mic_device, format=args.mic_format)
@@ -317,7 +354,8 @@ async def run():
     audio_outputs = []
 
     if player.audio:
-        pc.addTrack(player.audio)
+        input_track = player.audio
+        pc.addTrack(input_track)
     else:
         raise RuntimeError(f"No audio input found for device: {args.mic_device}")
 
@@ -368,15 +406,77 @@ async def run():
     await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
 
     print("Connected. Session id:", session_id)
-    print("Press Ctrl+C to stop.")
+    if not args.manual_control:
+        print("Press Ctrl+C to stop.")
 
     try:
-        while True:
-            await asyncio.sleep(1)
+        while not stop_event.is_set():
+            await asyncio.sleep(0.2)
     finally:
         for output in audio_outputs:
             await output.stop()
+        if input_track:
+            input_track.stop()
         await pc.close()
+        print("Disconnected.")
+
+
+async def run_manual_control(args):
+    """Controla conexión/desconexión con una tecla para el MVP."""
+    toggle_key = normalize_key(args.toggle_key)
+    quit_key = normalize_key(args.quit_key)
+    stop_event = None
+    session_task = None
+
+    print(f"Manual control enabled. Press '{args.toggle_key}' to connect/disconnect, '{args.quit_key}' to quit.")
+
+    while True:
+        key = await read_key()
+
+        if key == quit_key:
+            if session_task and not session_task.done():
+                stop_event.set()
+                await session_task
+            print("Bye.")
+            return
+
+        if key != toggle_key:
+            continue
+
+        if session_task and not session_task.done():
+            print("Disconnecting...")
+            stop_event.set()
+            await session_task
+            session_task = None
+            stop_event = None
+            continue
+
+        print("Connecting...")
+        stop_event = asyncio.Event()
+        session_task = asyncio.create_task(run_connected_session(args, stop_event))
+
+        def on_done(task):
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc:
+                print(f"Session stopped with error: {exc}")
+
+        session_task.add_done_callback(on_done)
+
+
+async def run():
+    """Punto de entrada del cliente."""
+    args = parse_args()
+
+    print("Innova WebRTC client version:", CLIENT_VERSION)
+    validate_args(args)
+
+    if args.manual_control:
+        await run_manual_control(args)
+        return
+
+    await run_connected_session(args)
 
 
 if __name__ == "__main__":
