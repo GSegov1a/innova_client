@@ -9,7 +9,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
-CLIENT_VERSION = "2026-04-30-clean-logs-audio"
+CLIENT_VERSION = "2026-04-30-sounddevice-float32"
 
 
 def default_audio_devices():
@@ -155,6 +155,7 @@ class SoundDeviceAudioPlayer:
         self.task = None
         self.sample_rate = None
         self.channels = None
+        self.frames_written = 0
 
     @staticmethod
     def _coerce_device(device):
@@ -168,13 +169,25 @@ class SoundDeviceAudioPlayer:
     async def start(self, track):
         try:
             import sounddevice as sd
+            import numpy as np
         except ImportError as exc:
             raise RuntimeError(
-                "Remote audio playback needs sounddevice on Windows. Install it with: pip install sounddevice"
+                "Remote audio playback needs sounddevice and numpy on Windows. "
+                "Install them with: pip install sounddevice numpy"
             ) from exc
 
         self.sd = sd
+        self.np = np
         self.task = asyncio.create_task(self._play(track))
+        self.task.add_done_callback(self._on_task_done)
+
+    def _on_task_done(self, task):
+        if task.cancelled():
+            return
+
+        exc = task.exception()
+        if exc:
+            print(f"Audio playback stopped with error: {exc}")
 
     async def stop(self):
         if self.task:
@@ -200,6 +213,7 @@ class SoundDeviceAudioPlayer:
 
             sample_rate = frame.sample_rate or 48000
             channels = audio.shape[1]
+            audio = self._to_float32(audio)
 
             if not self.stream or sample_rate != self.sample_rate or channels != self.channels:
                 if self.stream:
@@ -211,12 +225,29 @@ class SoundDeviceAudioPlayer:
                 self.stream = self.sd.OutputStream(
                     samplerate=sample_rate,
                     channels=channels,
-                    dtype=audio.dtype,
+                    dtype="float32",
                     device=self.device,
+                    blocksize=0,
                 )
                 self.stream.start()
+                device_info = self.sd.query_devices(self.stream.device, "output")
+                print(
+                    "Audio output:",
+                    f"{device_info['name']} ({sample_rate} Hz, {channels} channel{'s' if channels != 1 else ''})",
+                )
 
             await asyncio.to_thread(self.stream.write, audio)
+            self.frames_written += len(audio)
+
+    def _to_float32(self, audio):
+        if audio.dtype == self.np.float32:
+            return audio
+
+        if self.np.issubdtype(audio.dtype, self.np.integer):
+            scale = max(abs(self.np.iinfo(audio.dtype).min), self.np.iinfo(audio.dtype).max)
+            return (audio.astype(self.np.float32) / scale).clip(-1.0, 1.0)
+
+        return audio.astype(self.np.float32)
 
 
 async def run():
