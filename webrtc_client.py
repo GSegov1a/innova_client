@@ -5,11 +5,13 @@ import os
 import sys
 
 import aiohttp
-from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+import av
+import numpy as np
+from aiortc import MediaStreamTrack, RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
-CLIENT_VERSION = "2026-04-30-client-vad-update"
+CLIENT_VERSION = "2026-04-30-mute-mic-during-output"
 
 
 def default_audio_devices():
@@ -58,6 +60,7 @@ def parse_args():
     parser.add_argument("--vad-silence-ms", type=int, default=int(os.getenv("OPENAI_REALTIME_VAD_SILENCE_MS", "900")))
     parser.add_argument("--vad-interrupt-response", action="store_true")
     parser.add_argument("--noise-reduction", default=os.getenv("OPENAI_REALTIME_NOISE_REDUCTION", "near_field"))
+    parser.add_argument("--allow-barge-in", action="store_true")
     parser.add_argument("--verbose-events", action="store_true")
     return parser.parse_args()
 
@@ -100,8 +103,9 @@ async def exchange_sdp(backend_url: str, child_id: int, device_token: str, offer
 class RealtimeEventLogger:
     """Convierte eventos Realtime verbosos en logs orientados a conversación."""
 
-    def __init__(self, verbose_events: bool = False):
+    def __init__(self, verbose_events: bool = False, output_state_callback=None):
         self.verbose_events = verbose_events
+        self.output_state_callback = output_state_callback
         self.input_transcripts = {}
         self.output_transcripts = {}
 
@@ -130,6 +134,16 @@ class RealtimeEventLogger:
 
         if event_type == "output_audio_buffer.started":
             print("Playing assistant audio...")
+            self._set_output_active(True)
+            return None, None
+
+        if event_type == "output_audio_buffer.stopped":
+            self._set_output_active(False)
+            return None, None
+
+        if event_type == "output_audio_buffer.cleared":
+            print("Assistant audio was cleared.")
+            self._set_output_active(False)
             return None, None
 
         if event_type == "conversation.item.input_audio_transcription.delta":
@@ -156,7 +170,15 @@ class RealtimeEventLogger:
                 print(f"Assistant: {text.strip()}")
             return "assistant", text
 
+        if event_type == "response.done":
+            self._set_output_active(False)
+            return None, None
+
         return None, None
+
+    def _set_output_active(self, active):
+        if self.output_state_callback:
+            self.output_state_callback(active)
 
     def _print_session_audio_config(self, event):
         session = event.get("session") or {}
@@ -311,6 +333,45 @@ class SoundDeviceAudioPlayer:
         return audio
 
 
+class MutingAudioTrack(MediaStreamTrack):
+    """Proxy de micrófono que puede enviar silencio mientras conserva la conexión."""
+
+    kind = "audio"
+
+    def __init__(self, source):
+        super().__init__()
+        self.source = source
+        self.muted = False
+
+    def set_muted(self, muted):
+        if muted != self.muted:
+            print("Microphone muted while assistant speaks." if muted else "Microphone unmuted.")
+        self.muted = muted
+
+    async def recv(self):
+        frame = await self.source.recv()
+        if not self.muted:
+            return frame
+        return self._silent_frame(frame)
+
+    def stop(self):
+        super().stop()
+        self.source.stop()
+
+    def _silent_frame(self, frame):
+        silence = np.zeros_like(frame.to_ndarray())
+        layout = getattr(frame.layout, "name", "mono")
+        silent = av.AudioFrame.from_ndarray(
+            silence,
+            format=frame.format.name,
+            layout=layout,
+        )
+        silent.sample_rate = frame.sample_rate
+        silent.pts = frame.pts
+        silent.time_base = frame.time_base
+        return silent
+
+
 def validate_args(args):
     """Valida argumentos comunes antes de abrir dispositivos o red."""
     if not args.device_token:
@@ -386,9 +447,15 @@ async def run_connected_session(args, stop_event=None):
     stop_event = stop_event or asyncio.Event()
     pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[]))
     channel = pc.createDataChannel("oai-events")
-    event_logger = RealtimeEventLogger(args.verbose_events)
     session_id = None
     input_track = None
+    muted_input_track = None
+
+    def set_assistant_output_active(active):
+        if muted_input_track and not args.allow_barge_in:
+            muted_input_track.set_muted(active)
+
+    event_logger = RealtimeEventLogger(args.verbose_events, set_assistant_output_active)
 
     try:
         player = MediaPlayer(args.mic_device, format=args.mic_format)
@@ -404,7 +471,8 @@ async def run_connected_session(args, stop_event=None):
 
     if player.audio:
         input_track = player.audio
-        pc.addTrack(input_track)
+        muted_input_track = MutingAudioTrack(input_track)
+        pc.addTrack(muted_input_track)
     else:
         raise RuntimeError(f"No audio input found for device: {args.mic_device}")
 
