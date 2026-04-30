@@ -9,7 +9,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
-CLIENT_VERSION = "2026-04-30-sounddevice-float32"
+CLIENT_VERSION = "2026-04-30-speaker-rate"
 
 
 def default_audio_devices():
@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument("--mic-format", default=os.getenv("MIC_FORMAT", defaults["mic_format"]))
     parser.add_argument("--speaker-device", default=os.getenv("SPEAKER_DEVICE", defaults["speaker_device"]))
     parser.add_argument("--speaker-format", default=os.getenv("SPEAKER_FORMAT", defaults["speaker_format"]))
+    parser.add_argument("--speaker-rate", type=int, default=int(os.getenv("SPEAKER_RATE", "48000")))
     parser.add_argument("--verbose-events", action="store_true")
     return parser.parse_args()
 
@@ -149,8 +150,9 @@ class RealtimeEventLogger:
 class SoundDeviceAudioPlayer:
     """Reproduce una pista remota WebRTC con sounddevice cuando FFmpeg no tiene salida."""
 
-    def __init__(self, device=None):
+    def __init__(self, device=None, sample_rate=None):
         self.device = self._coerce_device(device)
+        self.output_sample_rate = sample_rate
         self.stream = None
         self.task = None
         self.sample_rate = None
@@ -211,7 +213,8 @@ class SoundDeviceAudioPlayer:
             elif audio.shape[0] <= 8 and audio.shape[0] < audio.shape[1]:
                 audio = audio.T
 
-            sample_rate = frame.sample_rate or 48000
+            frame_sample_rate = frame.sample_rate or 48000
+            sample_rate = self.output_sample_rate or frame_sample_rate
             channels = audio.shape[1]
             audio = self._to_float32(audio)
 
@@ -235,6 +238,8 @@ class SoundDeviceAudioPlayer:
                     "Audio output:",
                     f"{device_info['name']} ({sample_rate} Hz, {channels} channel{'s' if channels != 1 else ''})",
                 )
+                if frame_sample_rate != sample_rate:
+                    print(f"Audio frame rate: {frame_sample_rate} Hz; forced playback rate: {sample_rate} Hz")
 
             await asyncio.to_thread(self.stream.write, audio)
             self.frames_written += len(audio)
@@ -296,7 +301,7 @@ async def run():
         if track.kind == "audio":
             if not args.speaker_format:
                 print("Remote audio received. Using sounddevice playback.")
-                player = SoundDeviceAudioPlayer(args.speaker_device)
+                player = SoundDeviceAudioPlayer(args.speaker_device, args.speaker_rate)
                 await player.start(track)
                 audio_outputs.append(player)
                 return
