@@ -9,7 +9,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
-CLIENT_VERSION = "2026-04-30-manual-control"
+CLIENT_VERSION = "2026-04-30-client-vad-update"
 
 
 def default_audio_devices():
@@ -53,6 +53,11 @@ def parse_args():
     parser.add_argument("--manual-control", action="store_true")
     parser.add_argument("--toggle-key", default=os.getenv("TOGGLE_KEY", "c"))
     parser.add_argument("--quit-key", default=os.getenv("QUIT_KEY", "q"))
+    parser.add_argument("--vad-threshold", type=float, default=float(os.getenv("OPENAI_REALTIME_VAD_THRESHOLD", "0.75")))
+    parser.add_argument("--vad-prefix-ms", type=int, default=int(os.getenv("OPENAI_REALTIME_VAD_PREFIX_MS", "300")))
+    parser.add_argument("--vad-silence-ms", type=int, default=int(os.getenv("OPENAI_REALTIME_VAD_SILENCE_MS", "900")))
+    parser.add_argument("--vad-interrupt-response", action="store_true")
+    parser.add_argument("--noise-reduction", default=os.getenv("OPENAI_REALTIME_NOISE_REDUCTION", "near_field"))
     parser.add_argument("--verbose-events", action="store_true")
     return parser.parse_args()
 
@@ -111,6 +116,10 @@ class RealtimeEventLogger:
             print("Realtime session ready.")
             return None, None
 
+        if event_type == "session.updated":
+            self._print_session_audio_config(event)
+            return None, None
+
         if event_type == "input_audio_buffer.speech_started":
             print("Listening...")
             return None, None
@@ -148,6 +157,22 @@ class RealtimeEventLogger:
             return "assistant", text
 
         return None, None
+
+    def _print_session_audio_config(self, event):
+        session = event.get("session") or {}
+        audio = session.get("audio") or {}
+        audio_input = audio.get("input") or {}
+        turn_detection = audio_input.get("turn_detection") or {}
+
+        if not turn_detection:
+            return
+
+        print(
+            "Realtime VAD:",
+            f"threshold={turn_detection.get('threshold')},",
+            f"silence={turn_detection.get('silence_duration_ms')}ms,",
+            f"interrupt_response={turn_detection.get('interrupt_response')}",
+        )
 
 
 class SoundDeviceAudioPlayer:
@@ -332,6 +357,30 @@ async def read_key():
     return await asyncio.to_thread(read_key_blocking)
 
 
+def build_session_update(args):
+    """Construye una actualización explícita de VAD para la sesión Realtime."""
+    return {
+        "type": "session.update",
+        "session": {
+            "audio": {
+                "input": {
+                    "noise_reduction": {
+                        "type": args.noise_reduction,
+                    },
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": args.vad_threshold,
+                        "prefix_padding_ms": args.vad_prefix_ms,
+                        "silence_duration_ms": args.vad_silence_ms,
+                        "create_response": True,
+                        "interrupt_response": args.vad_interrupt_response,
+                    },
+                },
+            },
+        },
+    }
+
+
 async def run_connected_session(args, stop_event=None):
     """Abre una sesión WebRTC y la mantiene viva hasta recibir stop_event."""
     stop_event = stop_event or asyncio.Event()
@@ -390,6 +439,16 @@ async def run_connected_session(args, stop_event=None):
 
         if role and session_id:
             asyncio.create_task(post_turn(args.backend_url, session_id, args.device_token, role, text))
+
+    @channel.on("open")
+    def on_open():
+        channel.send(json.dumps(build_session_update(args)))
+        print(
+            "Sent VAD config:",
+            f"threshold={args.vad_threshold},",
+            f"silence={args.vad_silence_ms}ms,",
+            f"interrupt_response={args.vad_interrupt_response}",
+        )
 
     offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
