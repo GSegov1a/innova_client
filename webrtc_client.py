@@ -9,7 +9,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
-CLIENT_VERSION = "2026-04-30-audio-channel-layout"
+CLIENT_VERSION = "2026-04-30-packed-audio-layout"
 
 
 def default_audio_devices():
@@ -271,7 +271,13 @@ class SoundDeviceAudioPlayer:
                 return audio.reshape(-1, channel_count)
             return audio.reshape(-1, 1)
 
+        if audio.shape[0] == 1 and channel_count > 1 and audio.shape[1] % channel_count == 0:
+            return audio.reshape(-1, channel_count)
+
         if audio.shape[0] == channel_count and audio.shape[0] < audio.shape[1]:
+            return audio.T
+
+        if audio.shape[0] <= 8 and audio.shape[0] < audio.shape[1]:
             return audio.T
 
         return audio
