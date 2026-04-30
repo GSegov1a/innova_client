@@ -9,7 +9,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
-CLIENT_VERSION = "2026-04-30-speaker-rate"
+CLIENT_VERSION = "2026-04-30-audio-channel-layout"
 
 
 def default_audio_devices():
@@ -158,6 +158,7 @@ class SoundDeviceAudioPlayer:
         self.sample_rate = None
         self.channels = None
         self.frames_written = 0
+        self.logged_frame_format = False
 
     @staticmethod
     def _coerce_device(device):
@@ -207,16 +208,20 @@ class SoundDeviceAudioPlayer:
         while True:
             frame = await track.recv()
             audio = frame.to_ndarray()
-
-            if audio.ndim == 1:
-                audio = audio.reshape(-1, 1)
-            elif audio.shape[0] <= 8 and audio.shape[0] < audio.shape[1]:
-                audio = audio.T
-
+            channel_count = self._channel_count(frame)
             frame_sample_rate = frame.sample_rate or 48000
             sample_rate = self.output_sample_rate or frame_sample_rate
+            audio = self._shape_audio(audio, channel_count)
             channels = audio.shape[1]
             audio = self._to_float32(audio)
+
+            if not self.logged_frame_format:
+                print(
+                    "Audio frame:",
+                    f"{frame_sample_rate} Hz, {channel_count} channel{'s' if channel_count != 1 else ''},",
+                    f"{getattr(frame.format, 'name', 'unknown')} -> {channels} output channel{'s' if channels != 1 else ''}",
+                )
+                self.logged_frame_format = True
 
             if not self.stream or sample_rate != self.sample_rate or channels != self.channels:
                 if self.stream:
@@ -253,6 +258,23 @@ class SoundDeviceAudioPlayer:
             return (audio.astype(self.np.float32) / scale).clip(-1.0, 1.0)
 
         return audio.astype(self.np.float32)
+
+    def _channel_count(self, frame):
+        try:
+            return len(frame.layout.channels)
+        except (AttributeError, TypeError):
+            return 1
+
+    def _shape_audio(self, audio, channel_count):
+        if audio.ndim == 1:
+            if channel_count > 1 and len(audio) % channel_count == 0:
+                return audio.reshape(-1, channel_count)
+            return audio.reshape(-1, 1)
+
+        if audio.shape[0] == channel_count and audio.shape[0] < audio.shape[1]:
+            return audio.T
+
+        return audio
 
 
 async def run():
