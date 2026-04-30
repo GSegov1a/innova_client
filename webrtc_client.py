@@ -1,7 +1,7 @@
 import argparse
 import asyncio
 import json
-import os
+import logging
 import sys
 
 import aiohttp
@@ -11,7 +11,8 @@ from aiortc import MediaStreamTrack, RTCConfiguration, RTCPeerConnection, RTCSes
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
-CLIENT_VERSION = "2026-04-30-mute-mic-during-output"
+CLIENT_VERSION = "2026-04-30-clean-config-mute"
+LOGGER = logging.getLogger("innova-client")
 
 
 def default_audio_devices():
@@ -43,25 +44,28 @@ def default_audio_devices():
 def parse_args():
     """Lee la configuración necesaria para conectar el cliente al backend."""
     defaults = default_audio_devices()
-    parser = argparse.ArgumentParser(description="WebRTC audio client for OpenAI Realtime.")
-    parser.add_argument("--backend-url", default=os.getenv("BACKEND_URL", "http://127.0.0.1:8000"))
-    parser.add_argument("--child-id", type=int, default=int(os.getenv("CHILD_ID", "1")))
-    parser.add_argument("--device-token", default=os.getenv("RASPBERRY_DEVICE_TOKEN"))
-    parser.add_argument("--mic-device", default=os.getenv("MIC_DEVICE", defaults["mic_device"]))
-    parser.add_argument("--mic-format", default=os.getenv("MIC_FORMAT", defaults["mic_format"]))
-    parser.add_argument("--speaker-device", default=os.getenv("SPEAKER_DEVICE", defaults["speaker_device"]))
-    parser.add_argument("--speaker-format", default=os.getenv("SPEAKER_FORMAT", defaults["speaker_format"]))
-    parser.add_argument("--speaker-rate", type=int, default=int(os.getenv("SPEAKER_RATE", "48000")))
-    parser.add_argument("--manual-control", action="store_true")
-    parser.add_argument("--toggle-key", default=os.getenv("TOGGLE_KEY", "c"))
-    parser.add_argument("--quit-key", default=os.getenv("QUIT_KEY", "q"))
-    parser.add_argument("--vad-threshold", type=float, default=float(os.getenv("OPENAI_REALTIME_VAD_THRESHOLD", "0.75")))
-    parser.add_argument("--vad-prefix-ms", type=int, default=int(os.getenv("OPENAI_REALTIME_VAD_PREFIX_MS", "300")))
-    parser.add_argument("--vad-silence-ms", type=int, default=int(os.getenv("OPENAI_REALTIME_VAD_SILENCE_MS", "900")))
-    parser.add_argument("--vad-interrupt-response", action="store_true")
-    parser.add_argument("--noise-reduction", default=os.getenv("OPENAI_REALTIME_NOISE_REDUCTION", "near_field"))
-    parser.add_argument("--allow-barge-in", action="store_true")
-    parser.add_argument("--verbose-events", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="WebRTC audio client for Innova/OpenAI Realtime.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=(
+            'Windows example: python webrtc_client.py --backend-url http://192.168.1.91:8000 '
+            '--child-id 1 --device-token innovaraspberrytoken --mic-format dshow '
+            '--mic-device "audio=Micrófono (Realtek(R) Audio)" --speaker-device 3 '
+            "--speaker-rate 48000 --manual-control"
+        ),
+    )
+    parser.add_argument("--backend-url", default="http://127.0.0.1:8000", help="Backend base URL.")
+    parser.add_argument("--child-id", type=int, default=1, help="Child id used to create the Realtime session.")
+    parser.add_argument("--device-token", required=True, help="Device token sent as X-Device-Token.")
+    parser.add_argument("--mic-device", default=defaults["mic_device"], help="FFmpeg input device name.")
+    parser.add_argument("--mic-format", default=defaults["mic_format"], help="FFmpeg input format, e.g. dshow or alsa.")
+    parser.add_argument("--speaker-device", default=defaults["speaker_device"], help="Output device. On Windows use sounddevice index, e.g. 3.")
+    parser.add_argument("--speaker-format", default=defaults["speaker_format"], help="Optional FFmpeg output format. Leave empty on Windows to use sounddevice.")
+    parser.add_argument("--speaker-rate", type=int, default=48000, help="Playback sample rate used by sounddevice output.")
+    parser.add_argument("--manual-control", action="store_true", help="Start disconnected; press toggle key to connect/disconnect.")
+    parser.add_argument("--toggle-key", default="c", help="Key used in manual mode to connect/disconnect.")
+    parser.add_argument("--quit-key", default="q", help="Key used in manual mode to quit.")
+    parser.add_argument("--verbose-events", action="store_true", help="Print raw Realtime event names for debugging.")
     return parser.parse_args()
 
 
@@ -77,7 +81,7 @@ async def post_turn(backend_url: str, session_id: str, device_token: str, role: 
             headers={"X-Device-Token": device_token},
         ) as response:
             if response.status >= 400:
-                print("Failed to persist turn:", response.status, await response.text())
+                LOGGER.warning("Failed to persist turn: %s %s", response.status, await response.text())
 
 
 async def exchange_sdp(backend_url: str, child_id: int, device_token: str, offer_sdp: str):
@@ -114,26 +118,35 @@ class RealtimeEventLogger:
         event_type = event.get("type")
 
         if self.verbose_events:
-            print("Realtime event:", event_type)
+            LOGGER.info("Realtime event: %s", event_type)
+
+        if event_type == "error":
+            LOGGER.error("Realtime error: %s", event.get("error") or event)
+            return None, None
 
         if event_type == "session.created":
-            print("Realtime session ready.")
+            LOGGER.info("Realtime session ready.")
+            self._print_session_audio_config(event)
             return None, None
 
         if event_type == "session.updated":
             self._print_session_audio_config(event)
             return None, None
 
+        if event_type in {"response.created", "response.output_item.added"}:
+            self._set_output_active(True)
+            return None, None
+
         if event_type == "input_audio_buffer.speech_started":
-            print("Listening...")
+            LOGGER.info("Listening...")
             return None, None
 
         if event_type == "input_audio_buffer.speech_stopped":
-            print("Processing speech...")
+            LOGGER.info("Processing speech...")
             return None, None
 
         if event_type == "output_audio_buffer.started":
-            print("Playing assistant audio...")
+            LOGGER.info("Playing assistant audio...")
             self._set_output_active(True)
             return None, None
 
@@ -142,7 +155,7 @@ class RealtimeEventLogger:
             return None, None
 
         if event_type == "output_audio_buffer.cleared":
-            print("Assistant audio was cleared.")
+            LOGGER.info("Assistant audio was cleared.")
             self._set_output_active(False)
             return None, None
 
@@ -155,7 +168,7 @@ class RealtimeEventLogger:
             key = event.get("item_id") or "latest"
             text = event.get("transcript") or self.input_transcripts.pop(key, "")
             if text.strip():
-                print(f"Child: {text.strip()}")
+                LOGGER.info("Child: %s", text.strip())
             return "child", text
 
         if event_type == "response.output_audio_transcript.delta":
@@ -167,7 +180,7 @@ class RealtimeEventLogger:
             key = event.get("item_id") or event.get("response_id") or "latest"
             text = event.get("transcript") or event.get("text") or self.output_transcripts.pop(key, "")
             if text.strip():
-                print(f"Assistant: {text.strip()}")
+                LOGGER.info("Assistant: %s", text.strip())
             return "assistant", text
 
         if event_type == "response.done":
@@ -189,11 +202,11 @@ class RealtimeEventLogger:
         if not turn_detection:
             return
 
-        print(
-            "Realtime VAD:",
-            f"threshold={turn_detection.get('threshold')},",
-            f"silence={turn_detection.get('silence_duration_ms')}ms,",
-            f"interrupt_response={turn_detection.get('interrupt_response')}",
+        LOGGER.info(
+            "Realtime VAD: threshold=%s, silence=%sms, interrupt_response=%s",
+            turn_detection.get("threshold"),
+            turn_detection.get("silence_duration_ms"),
+            turn_detection.get("interrupt_response"),
         )
 
 
@@ -240,7 +253,7 @@ class SoundDeviceAudioPlayer:
 
         exc = task.exception()
         if exc:
-            print(f"Audio playback stopped with error: {exc}")
+            LOGGER.error("Audio playback stopped with error: %s", exc)
 
     async def stop(self):
         if self.task:
@@ -266,10 +279,14 @@ class SoundDeviceAudioPlayer:
             audio = self._to_float32(audio)
 
             if not self.logged_frame_format:
-                print(
-                    "Audio frame:",
-                    f"{frame_sample_rate} Hz, {channel_count} channel{'s' if channel_count != 1 else ''},",
-                    f"{getattr(frame.format, 'name', 'unknown')} -> {channels} output channel{'s' if channels != 1 else ''}",
+                LOGGER.info(
+                    "Audio frame: %s Hz, %s channel%s, %s -> %s output channel%s",
+                    frame_sample_rate,
+                    channel_count,
+                    "s" if channel_count != 1 else "",
+                    getattr(frame.format, "name", "unknown"),
+                    channels,
+                    "s" if channels != 1 else "",
                 )
                 self.logged_frame_format = True
 
@@ -289,12 +306,15 @@ class SoundDeviceAudioPlayer:
                 )
                 self.stream.start()
                 device_info = self.sd.query_devices(self.stream.device, "output")
-                print(
-                    "Audio output:",
-                    f"{device_info['name']} ({sample_rate} Hz, {channels} channel{'s' if channels != 1 else ''})",
+                LOGGER.info(
+                    "Audio output: %s (%s Hz, %s channel%s)",
+                    device_info["name"],
+                    sample_rate,
+                    channels,
+                    "s" if channels != 1 else "",
                 )
                 if frame_sample_rate != sample_rate:
-                    print(f"Audio frame rate: {frame_sample_rate} Hz; forced playback rate: {sample_rate} Hz")
+                    LOGGER.info("Audio frame rate: %s Hz; forced playback rate: %s Hz", frame_sample_rate, sample_rate)
 
             await asyncio.to_thread(self.stream.write, audio)
             self.frames_written += len(audio)
@@ -345,7 +365,7 @@ class MutingAudioTrack(MediaStreamTrack):
 
     def set_muted(self, muted):
         if muted != self.muted:
-            print("Microphone muted while assistant speaks." if muted else "Microphone unmuted.")
+            LOGGER.info("Microphone muted while assistant speaks." if muted else "Microphone unmuted.")
         self.muted = muted
 
     async def recv(self):
@@ -374,12 +394,9 @@ class MutingAudioTrack(MediaStreamTrack):
 
 def validate_args(args):
     """Valida argumentos comunes antes de abrir dispositivos o red."""
-    if not args.device_token:
-        raise RuntimeError("RASPBERRY_DEVICE_TOKEN is required")
-
     if not args.mic_device:
         raise RuntimeError(
-            "MIC_DEVICE is required on Windows because DirectShow does not provide a portable default "
+            "--mic-device is required on Windows because DirectShow does not provide a portable default "
             "microphone alias. Run `ffmpeg -list_devices true -f dshow -i dummy` and then pass "
             '`--mic-device "audio=Exact Microphone Name"`.'
         )
@@ -418,30 +435,6 @@ async def read_key():
     return await asyncio.to_thread(read_key_blocking)
 
 
-def build_session_update(args):
-    """Construye una actualización explícita de VAD para la sesión Realtime."""
-    return {
-        "type": "session.update",
-        "session": {
-            "audio": {
-                "input": {
-                    "noise_reduction": {
-                        "type": args.noise_reduction,
-                    },
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": args.vad_threshold,
-                        "prefix_padding_ms": args.vad_prefix_ms,
-                        "silence_duration_ms": args.vad_silence_ms,
-                        "create_response": True,
-                        "interrupt_response": args.vad_interrupt_response,
-                    },
-                },
-            },
-        },
-    }
-
-
 async def run_connected_session(args, stop_event=None):
     """Abre una sesión WebRTC y la mantiene viva hasta recibir stop_event."""
     stop_event = stop_event or asyncio.Event()
@@ -450,10 +443,33 @@ async def run_connected_session(args, stop_event=None):
     session_id = None
     input_track = None
     muted_input_track = None
+    unmute_task = None
+
+    def clear_input_buffer():
+        if channel.readyState == "open":
+            channel.send(json.dumps({"type": "input_audio_buffer.clear"}))
+            LOGGER.info("Cleared input audio buffer.")
 
     def set_assistant_output_active(active):
-        if muted_input_track and not args.allow_barge_in:
-            muted_input_track.set_muted(active)
+        nonlocal unmute_task
+
+        if not muted_input_track:
+            return
+
+        if active:
+            if unmute_task and not unmute_task.done():
+                unmute_task.cancel()
+            muted_input_track.set_muted(True)
+            clear_input_buffer()
+            return
+
+        async def delayed_unmute():
+            await asyncio.sleep(0.3)
+            muted_input_track.set_muted(False)
+
+        if unmute_task and not unmute_task.done():
+            unmute_task.cancel()
+        unmute_task = asyncio.create_task(delayed_unmute())
 
     event_logger = RealtimeEventLogger(args.verbose_events, set_assistant_output_active)
 
@@ -479,11 +495,11 @@ async def run_connected_session(args, stop_event=None):
     @pc.on("track")
     async def on_track(track):
         if args.verbose_events:
-            print("Remote track received:", track.kind)
+            LOGGER.info("Remote track received: %s", track.kind)
 
         if track.kind == "audio":
             if not args.speaker_format:
-                print("Remote audio received. Using sounddevice playback.")
+                LOGGER.info("Remote audio received. Using sounddevice playback.")
                 player = SoundDeviceAudioPlayer(args.speaker_device, args.speaker_rate)
                 await player.start(track)
                 audio_outputs.append(player)
@@ -510,19 +526,13 @@ async def run_connected_session(args, stop_event=None):
 
     @channel.on("open")
     def on_open():
-        channel.send(json.dumps(build_session_update(args)))
-        print(
-            "Sent VAD config:",
-            f"threshold={args.vad_threshold},",
-            f"silence={args.vad_silence_ms}ms,",
-            f"interrupt_response={args.vad_interrupt_response}",
-        )
+        LOGGER.info("Realtime data channel open.")
 
     offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
     offer_sdp = offer.sdp
 
-    print("Generated SDP offer bytes:", len(offer_sdp.encode("utf-8")))
+    LOGGER.info("Generated SDP offer bytes: %s", len(offer_sdp.encode("utf-8")))
     session_id, answer_sdp = await exchange_sdp(
         args.backend_url,
         args.child_id,
@@ -532,9 +542,9 @@ async def run_connected_session(args, stop_event=None):
 
     await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
 
-    print("Connected. Session id:", session_id)
+    LOGGER.info("Connected. Session id: %s", session_id)
     if not args.manual_control:
-        print("Press Ctrl+C to stop.")
+        LOGGER.info("Press Ctrl+C to stop.")
 
     try:
         while not stop_event.is_set():
@@ -542,10 +552,12 @@ async def run_connected_session(args, stop_event=None):
     finally:
         for output in audio_outputs:
             await output.stop()
+        if unmute_task and not unmute_task.done():
+            unmute_task.cancel()
         if input_track:
             input_track.stop()
         await pc.close()
-        print("Disconnected.")
+        LOGGER.info("Disconnected.")
 
 
 async def run_manual_control(args):
@@ -555,7 +567,7 @@ async def run_manual_control(args):
     stop_event = None
     session_task = None
 
-    print(f"Manual control enabled. Press '{args.toggle_key}' to connect/disconnect, '{args.quit_key}' to quit.")
+    LOGGER.info("Manual control enabled. Press '%s' to connect/disconnect, '%s' to quit.", args.toggle_key, args.quit_key)
 
     while True:
         key = await read_key()
@@ -564,21 +576,21 @@ async def run_manual_control(args):
             if session_task and not session_task.done():
                 stop_event.set()
                 await session_task
-            print("Bye.")
+            LOGGER.info("Bye.")
             return
 
         if key != toggle_key:
             continue
 
         if session_task and not session_task.done():
-            print("Disconnecting...")
+            LOGGER.info("Disconnecting...")
             stop_event.set()
             await session_task
             session_task = None
             stop_event = None
             continue
 
-        print("Connecting...")
+        LOGGER.info("Connecting...")
         stop_event = asyncio.Event()
         session_task = asyncio.create_task(run_connected_session(args, stop_event))
 
@@ -587,16 +599,43 @@ async def run_manual_control(args):
                 return
             exc = task.exception()
             if exc:
-                print(f"Session stopped with error: {exc}")
+                LOGGER.error("Session stopped with error: %s", exc)
 
         session_task.add_done_callback(on_done)
+
+
+def configure_logging():
+    """Configura logs simples y legibles para uso en consola."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+
+
+def mask_secret(value):
+    """Enmascara tokens sin ocultar completamente qué valor está en uso."""
+    if not value:
+        return "<missing>"
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def log_startup_config(args):
+    """Imprime la configuración efectiva importante del cliente."""
+    LOGGER.info("Innova WebRTC client version: %s", CLIENT_VERSION)
+    LOGGER.info("Backend URL: %s", args.backend_url)
+    LOGGER.info("Child id: %s", args.child_id)
+    LOGGER.info("Device token: %s", mask_secret(args.device_token))
+    LOGGER.info("Microphone: device=%r format=%r", args.mic_device, args.mic_format)
+    LOGGER.info("Speaker: device=%r format=%r rate=%s", args.speaker_device, args.speaker_format, args.speaker_rate)
+    LOGGER.info("Manual control: %s (toggle=%r quit=%r)", args.manual_control, args.toggle_key, args.quit_key)
+    LOGGER.info("Realtime model/VAD config is controlled by backend environment variables.")
 
 
 async def run():
     """Punto de entrada del cliente."""
     args = parse_args()
 
-    print("Innova WebRTC client version:", CLIENT_VERSION)
+    configure_logging()
+    log_startup_config(args)
     validate_args(args)
 
     if args.manual_control:
