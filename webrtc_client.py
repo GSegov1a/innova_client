@@ -9,11 +9,14 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
+CLIENT_VERSION = "2026-04-30-sdp-debug"
+
+
 def default_audio_devices():
     """Devuelve dispositivos/formatos de FFmpeg razonables para cada plataforma."""
     if sys.platform.startswith("win"):
         return {
-            "mic_device": "audio=default",
+            "mic_device": None,
             "mic_format": "dshow",
             "speaker_device": None,
             "speaker_format": None,
@@ -66,6 +69,9 @@ async def post_turn(backend_url: str, session_id: str, device_token: str, role: 
 
 async def exchange_sdp(backend_url: str, child_id: int, device_token: str, offer_sdp: str):
     """Intercambia el SDP offer local por el SDP answer creado por el backend."""
+    if not offer_sdp.strip().startswith("v=0"):
+        raise RuntimeError(f"Invalid local SDP offer generated. Length: {len(offer_sdp)}")
+
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{backend_url}/realtime/sessions/{child_id}/sdp",
@@ -100,8 +106,17 @@ async def run():
     """Conecta micrófono/parlante del cliente con OpenAI Realtime vía WebRTC."""
     args = parse_args()
 
+    print("Innova WebRTC client version:", CLIENT_VERSION)
+
     if not args.device_token:
         raise RuntimeError("RASPBERRY_DEVICE_TOKEN is required")
+
+    if not args.mic_device:
+        raise RuntimeError(
+            "MIC_DEVICE is required on Windows because DirectShow does not provide a portable default "
+            "microphone alias. Run `ffmpeg -list_devices true -f dshow -i dummy` and then pass "
+            '`--mic-device "audio=Exact Microphone Name"`.'
+        )
 
     pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[]))
     channel = pc.createDataChannel("oai-events")
@@ -109,11 +124,12 @@ async def run():
 
     try:
         player = MediaPlayer(args.mic_device, format=args.mic_format)
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         raise RuntimeError(
             f"Could not open microphone {args.mic_device!r} with format {args.mic_format!r}. "
-            "On Windows use --mic-format dshow and a device like --mic-device audio=default, "
-            "or --mic-device \"audio=Microphone Name\"."
+            "On Windows use --mic-format dshow and the exact DirectShow device name, for example "
+            '--mic-device "audio=Microphone Name". List devices with: '
+            "ffmpeg -list_devices true -f dshow -i dummy"
         ) from exc
 
     recorders = []
@@ -152,12 +168,14 @@ async def run():
 
     offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
+    offer_sdp = offer.sdp
 
+    print("Generated SDP offer bytes:", len(offer_sdp.encode("utf-8")))
     session_id, answer_sdp = await exchange_sdp(
         args.backend_url,
         args.child_id,
         args.device_token,
-        pc.localDescription.sdp,
+        offer_sdp,
     )
 
     await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
