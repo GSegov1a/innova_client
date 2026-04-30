@@ -9,7 +9,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
-CLIENT_VERSION = "2026-04-30-sdp-debug"
+CLIENT_VERSION = "2026-04-30-clean-logs-audio"
 
 
 def default_audio_devices():
@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument("--mic-format", default=os.getenv("MIC_FORMAT", defaults["mic_format"]))
     parser.add_argument("--speaker-device", default=os.getenv("SPEAKER_DEVICE", defaults["speaker_device"]))
     parser.add_argument("--speaker-format", default=os.getenv("SPEAKER_FORMAT", defaults["speaker_format"]))
+    parser.add_argument("--verbose-events", action="store_true")
     return parser.parse_args()
 
 
@@ -87,19 +88,135 @@ async def exchange_sdp(backend_url: str, child_id: int, device_token: str, offer
             return response.headers["X-Session-Id"], await response.text()
 
 
-def handle_realtime_event(message: str):
-    """Extrae turnos finales desde eventos del data channel de OpenAI Realtime."""
-    event = json.loads(message)
-    event_type = event.get("type")
+class RealtimeEventLogger:
+    """Convierte eventos Realtime verbosos en logs orientados a conversación."""
 
-    if event_type == "conversation.item.input_audio_transcription.completed":
-        return "child", event.get("transcript", "")
+    def __init__(self, verbose_events: bool = False):
+        self.verbose_events = verbose_events
+        self.input_transcripts = {}
+        self.output_transcripts = {}
 
-    if event_type in {"response.output_audio_transcript.done", "response.output_text.done"}:
-        return "assistant", event.get("transcript") or event.get("text", "")
+    def handle(self, message: str):
+        event = json.loads(message)
+        event_type = event.get("type")
 
-    print("Realtime event:", event_type)
-    return None, None
+        if self.verbose_events:
+            print("Realtime event:", event_type)
+
+        if event_type == "session.created":
+            print("Realtime session ready.")
+            return None, None
+
+        if event_type == "input_audio_buffer.speech_started":
+            print("Listening...")
+            return None, None
+
+        if event_type == "input_audio_buffer.speech_stopped":
+            print("Processing speech...")
+            return None, None
+
+        if event_type == "output_audio_buffer.started":
+            print("Playing assistant audio...")
+            return None, None
+
+        if event_type == "conversation.item.input_audio_transcription.delta":
+            key = event.get("item_id") or "latest"
+            self.input_transcripts[key] = self.input_transcripts.get(key, "") + event.get("delta", "")
+            return None, None
+
+        if event_type == "conversation.item.input_audio_transcription.completed":
+            key = event.get("item_id") or "latest"
+            text = event.get("transcript") or self.input_transcripts.pop(key, "")
+            if text.strip():
+                print(f"Child: {text.strip()}")
+            return "child", text
+
+        if event_type == "response.output_audio_transcript.delta":
+            key = event.get("item_id") or event.get("response_id") or "latest"
+            self.output_transcripts[key] = self.output_transcripts.get(key, "") + event.get("delta", "")
+            return None, None
+
+        if event_type in {"response.output_audio_transcript.done", "response.output_text.done"}:
+            key = event.get("item_id") or event.get("response_id") or "latest"
+            text = event.get("transcript") or event.get("text") or self.output_transcripts.pop(key, "")
+            if text.strip():
+                print(f"Assistant: {text.strip()}")
+            return "assistant", text
+
+        return None, None
+
+
+class SoundDeviceAudioPlayer:
+    """Reproduce una pista remota WebRTC con sounddevice cuando FFmpeg no tiene salida."""
+
+    def __init__(self, device=None):
+        self.device = self._coerce_device(device)
+        self.stream = None
+        self.task = None
+        self.sample_rate = None
+        self.channels = None
+
+    @staticmethod
+    def _coerce_device(device):
+        if device in {None, ""}:
+            return None
+        try:
+            return int(device)
+        except ValueError:
+            return device
+
+    async def start(self, track):
+        try:
+            import sounddevice as sd
+        except ImportError as exc:
+            raise RuntimeError(
+                "Remote audio playback needs sounddevice on Windows. Install it with: pip install sounddevice"
+            ) from exc
+
+        self.sd = sd
+        self.task = asyncio.create_task(self._play(track))
+
+    async def stop(self):
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+
+    async def _play(self, track):
+        while True:
+            frame = await track.recv()
+            audio = frame.to_ndarray()
+
+            if audio.ndim == 1:
+                audio = audio.reshape(-1, 1)
+            elif audio.shape[0] <= 8 and audio.shape[0] < audio.shape[1]:
+                audio = audio.T
+
+            sample_rate = frame.sample_rate or 48000
+            channels = audio.shape[1]
+
+            if not self.stream or sample_rate != self.sample_rate or channels != self.channels:
+                if self.stream:
+                    self.stream.stop()
+                    self.stream.close()
+
+                self.sample_rate = sample_rate
+                self.channels = channels
+                self.stream = self.sd.OutputStream(
+                    samplerate=sample_rate,
+                    channels=channels,
+                    dtype=audio.dtype,
+                    device=self.device,
+                )
+                self.stream.start()
+
+            await asyncio.to_thread(self.stream.write, audio)
 
 
 async def run():
@@ -120,6 +237,7 @@ async def run():
 
     pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[]))
     channel = pc.createDataChannel("oai-events")
+    event_logger = RealtimeEventLogger(args.verbose_events)
     session_id = None
 
     try:
@@ -132,7 +250,7 @@ async def run():
             "ffmpeg -list_devices true -f dshow -i dummy"
         ) from exc
 
-    recorders = []
+    audio_outputs = []
 
     if player.audio:
         pc.addTrack(player.audio)
@@ -141,10 +259,15 @@ async def run():
 
     @pc.on("track")
     async def on_track(track):
-        print("Remote track received:", track.kind)
+        if args.verbose_events:
+            print("Remote track received:", track.kind)
+
         if track.kind == "audio":
             if not args.speaker_format:
-                print("Remote audio playback is disabled; set --speaker-format to enable it.")
+                print("Remote audio received. Using sounddevice playback.")
+                player = SoundDeviceAudioPlayer(args.speaker_device)
+                await player.start(track)
+                audio_outputs.append(player)
                 return
 
             try:
@@ -157,11 +280,11 @@ async def run():
 
             recorder.addTrack(track)
             await recorder.start()
-            recorders.append(recorder)
+            audio_outputs.append(recorder)
 
     @channel.on("message")
     def on_message(message):
-        role, text = handle_realtime_event(message)
+        role, text = event_logger.handle(message)
 
         if role and session_id:
             asyncio.create_task(post_turn(args.backend_url, session_id, args.device_token, role, text))
@@ -187,8 +310,8 @@ async def run():
         while True:
             await asyncio.sleep(1)
     finally:
-        for recorder in recorders:
-            await recorder.stop()
+        for output in audio_outputs:
+            await output.stop()
         await pc.close()
 
 
