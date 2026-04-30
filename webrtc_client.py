@@ -11,7 +11,7 @@ from aiortc import MediaStreamTrack, RTCConfiguration, RTCPeerConnection, RTCSes
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
-CLIENT_VERSION = "2026-04-30-clean-config-mute"
+CLIENT_VERSION = "2026-04-30-audio-gate"
 LOGGER = logging.getLogger("innova-client")
 
 
@@ -107,9 +107,9 @@ async def exchange_sdp(backend_url: str, child_id: int, device_token: str, offer
 class RealtimeEventLogger:
     """Convierte eventos Realtime verbosos en logs orientados a conversación."""
 
-    def __init__(self, verbose_events: bool = False, output_state_callback=None):
+    def __init__(self, verbose_events: bool = False, output_event_callback=None):
         self.verbose_events = verbose_events
-        self.output_state_callback = output_state_callback
+        self.output_event_callback = output_event_callback
         self.input_transcripts = {}
         self.output_transcripts = {}
 
@@ -126,7 +126,6 @@ class RealtimeEventLogger:
 
         if event_type == "session.created":
             LOGGER.info("Realtime session ready.")
-            self._print_session_audio_config(event)
             return None, None
 
         if event_type == "session.updated":
@@ -134,7 +133,7 @@ class RealtimeEventLogger:
             return None, None
 
         if event_type in {"response.created", "response.output_item.added"}:
-            self._set_output_active(True)
+            self._handle_output_event(event_type)
             return None, None
 
         if event_type == "input_audio_buffer.speech_started":
@@ -147,16 +146,16 @@ class RealtimeEventLogger:
 
         if event_type == "output_audio_buffer.started":
             LOGGER.info("Playing assistant audio...")
-            self._set_output_active(True)
+            self._handle_output_event(event_type)
             return None, None
 
         if event_type == "output_audio_buffer.stopped":
-            self._set_output_active(False)
+            self._handle_output_event(event_type)
             return None, None
 
         if event_type == "output_audio_buffer.cleared":
-            LOGGER.info("Assistant audio was cleared.")
-            self._set_output_active(False)
+            LOGGER.warning("Assistant audio buffer was cleared before finishing.")
+            self._handle_output_event(event_type)
             return None, None
 
         if event_type == "conversation.item.input_audio_transcription.delta":
@@ -183,15 +182,11 @@ class RealtimeEventLogger:
                 LOGGER.info("Assistant: %s", text.strip())
             return "assistant", text
 
-        if event_type == "response.done":
-            self._set_output_active(False)
-            return None, None
-
         return None, None
 
-    def _set_output_active(self, active):
-        if self.output_state_callback:
-            self.output_state_callback(active)
+    def _handle_output_event(self, event_type):
+        if self.output_event_callback:
+            self.output_event_callback(event_type)
 
     def _print_session_audio_config(self, event):
         session = event.get("session") or {}
@@ -279,7 +274,7 @@ class SoundDeviceAudioPlayer:
             audio = self._to_float32(audio)
 
             if not self.logged_frame_format:
-                LOGGER.info(
+                LOGGER.debug(
                     "Audio frame: %s Hz, %s channel%s, %s -> %s output channel%s",
                     frame_sample_rate,
                     channel_count,
@@ -314,7 +309,7 @@ class SoundDeviceAudioPlayer:
                     "s" if channels != 1 else "",
                 )
                 if frame_sample_rate != sample_rate:
-                    LOGGER.info("Audio frame rate: %s Hz; forced playback rate: %s Hz", frame_sample_rate, sample_rate)
+                    LOGGER.debug("Audio frame rate: %s Hz; forced playback rate: %s Hz", frame_sample_rate, sample_rate)
 
             await asyncio.to_thread(self.stream.write, audio)
             self.frames_written += len(audio)
@@ -392,6 +387,62 @@ class MutingAudioTrack(MediaStreamTrack):
         return silent
 
 
+class AssistantAudioGate:
+    """Silencia el micrófono mientras el asistente genera o reproduce audio."""
+
+    START_EVENTS = {"response.created", "response.output_item.added", "output_audio_buffer.started"}
+    STOP_EVENTS = {"output_audio_buffer.stopped", "output_audio_buffer.cleared"}
+
+    def __init__(self, muted_track, channel, cooldown_seconds=0.5):
+        self.muted_track = muted_track
+        self.channel = channel
+        self.cooldown_seconds = cooldown_seconds
+        self.unmute_task = None
+        self.is_muted = False
+
+    def handle_event(self, event_type):
+        if event_type in self.START_EVENTS:
+            self.mute()
+            return
+
+        if event_type in self.STOP_EVENTS:
+            self.schedule_unmute()
+
+    def mute(self):
+        if self.unmute_task and not self.unmute_task.done():
+            self.unmute_task.cancel()
+
+        if self.is_muted:
+            return
+
+        self.is_muted = True
+        self.muted_track.set_muted(True)
+        self.clear_input_buffer()
+
+    def schedule_unmute(self):
+        if self.unmute_task and not self.unmute_task.done():
+            self.unmute_task.cancel()
+        self.unmute_task = asyncio.create_task(self._delayed_unmute())
+
+    async def stop(self):
+        if self.unmute_task and not self.unmute_task.done():
+            self.unmute_task.cancel()
+            try:
+                await self.unmute_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _delayed_unmute(self):
+        await asyncio.sleep(self.cooldown_seconds)
+        self.is_muted = False
+        self.muted_track.set_muted(False)
+
+    def clear_input_buffer(self):
+        if self.channel.readyState == "open":
+            self.channel.send(json.dumps({"type": "input_audio_buffer.clear"}))
+            LOGGER.debug("Cleared input audio buffer.")
+
+
 def validate_args(args):
     """Valida argumentos comunes antes de abrir dispositivos o red."""
     if not args.mic_device:
@@ -443,35 +494,13 @@ async def run_connected_session(args, stop_event=None):
     session_id = None
     input_track = None
     muted_input_track = None
-    unmute_task = None
+    audio_gate = None
 
-    def clear_input_buffer():
-        if channel.readyState == "open":
-            channel.send(json.dumps({"type": "input_audio_buffer.clear"}))
-            LOGGER.info("Cleared input audio buffer.")
+    def handle_output_event(event_type):
+        if audio_gate:
+            audio_gate.handle_event(event_type)
 
-    def set_assistant_output_active(active):
-        nonlocal unmute_task
-
-        if not muted_input_track:
-            return
-
-        if active:
-            if unmute_task and not unmute_task.done():
-                unmute_task.cancel()
-            muted_input_track.set_muted(True)
-            clear_input_buffer()
-            return
-
-        async def delayed_unmute():
-            await asyncio.sleep(0.3)
-            muted_input_track.set_muted(False)
-
-        if unmute_task and not unmute_task.done():
-            unmute_task.cancel()
-        unmute_task = asyncio.create_task(delayed_unmute())
-
-    event_logger = RealtimeEventLogger(args.verbose_events, set_assistant_output_active)
+    event_logger = RealtimeEventLogger(args.verbose_events, handle_output_event)
 
     try:
         player = MediaPlayer(args.mic_device, format=args.mic_format)
@@ -488,6 +517,7 @@ async def run_connected_session(args, stop_event=None):
     if player.audio:
         input_track = player.audio
         muted_input_track = MutingAudioTrack(input_track)
+        audio_gate = AssistantAudioGate(muted_input_track, channel)
         pc.addTrack(muted_input_track)
     else:
         raise RuntimeError(f"No audio input found for device: {args.mic_device}")
@@ -532,7 +562,7 @@ async def run_connected_session(args, stop_event=None):
     await pc.setLocalDescription(offer)
     offer_sdp = offer.sdp
 
-    LOGGER.info("Generated SDP offer bytes: %s", len(offer_sdp.encode("utf-8")))
+    LOGGER.debug("Generated SDP offer bytes: %s", len(offer_sdp.encode("utf-8")))
     session_id, answer_sdp = await exchange_sdp(
         args.backend_url,
         args.child_id,
@@ -552,8 +582,8 @@ async def run_connected_session(args, stop_event=None):
     finally:
         for output in audio_outputs:
             await output.stop()
-        if unmute_task and not unmute_task.done():
-            unmute_task.cancel()
+        if audio_gate:
+            await audio_gate.stop()
         if input_track:
             input_track.stop()
         await pc.close()
@@ -604,9 +634,12 @@ async def run_manual_control(args):
         session_task.add_done_callback(on_done)
 
 
-def configure_logging():
+def configure_logging(verbose=False):
     """Configura logs simples y legibles para uso en consola."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    for logger_name in ("aioice", "aiortc", "pyee"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def mask_secret(value):
@@ -621,20 +654,17 @@ def mask_secret(value):
 def log_startup_config(args):
     """Imprime la configuración efectiva importante del cliente."""
     LOGGER.info("Innova WebRTC client version: %s", CLIENT_VERSION)
-    LOGGER.info("Backend URL: %s", args.backend_url)
-    LOGGER.info("Child id: %s", args.child_id)
-    LOGGER.info("Device token: %s", mask_secret(args.device_token))
+    LOGGER.info("Backend: %s child_id=%s token=%s", args.backend_url, args.child_id, mask_secret(args.device_token))
     LOGGER.info("Microphone: device=%r format=%r", args.mic_device, args.mic_format)
     LOGGER.info("Speaker: device=%r format=%r rate=%s", args.speaker_device, args.speaker_format, args.speaker_rate)
     LOGGER.info("Manual control: %s (toggle=%r quit=%r)", args.manual_control, args.toggle_key, args.quit_key)
-    LOGGER.info("Realtime model/VAD config is controlled by backend environment variables.")
 
 
 async def run():
     """Punto de entrada del cliente."""
     args = parse_args()
 
-    configure_logging()
+    configure_logging(args.verbose_events)
     log_startup_config(args)
     validate_args(args)
 
