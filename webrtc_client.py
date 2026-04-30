@@ -2,20 +2,50 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 
 import aiohttp
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder
 
 
+def default_audio_devices():
+    """Devuelve dispositivos/formatos de FFmpeg razonables para cada plataforma."""
+    if sys.platform.startswith("win"):
+        return {
+            "mic_device": "audio=default",
+            "mic_format": "dshow",
+            "speaker_device": None,
+            "speaker_format": None,
+        }
+
+    if sys.platform == "darwin":
+        return {
+            "mic_device": ":0",
+            "mic_format": "avfoundation",
+            "speaker_device": "-",
+            "speaker_format": "audiotoolbox",
+        }
+
+    return {
+        "mic_device": "default",
+        "mic_format": "alsa",
+        "speaker_device": "default",
+        "speaker_format": "alsa",
+    }
+
+
 def parse_args():
-    """Lee la configuración necesaria para conectar el Raspberry al backend."""
-    parser = argparse.ArgumentParser(description="Raspberry Pi WebRTC client for OpenAI Realtime.")
+    """Lee la configuración necesaria para conectar el cliente al backend."""
+    defaults = default_audio_devices()
+    parser = argparse.ArgumentParser(description="WebRTC audio client for OpenAI Realtime.")
     parser.add_argument("--backend-url", default=os.getenv("BACKEND_URL", "http://127.0.0.1:8000"))
     parser.add_argument("--child-id", type=int, default=int(os.getenv("CHILD_ID", "1")))
     parser.add_argument("--device-token", default=os.getenv("RASPBERRY_DEVICE_TOKEN"))
-    parser.add_argument("--mic-device", default=os.getenv("MIC_DEVICE", "default"))
-    parser.add_argument("--speaker-device", default=os.getenv("SPEAKER_DEVICE", "default"))
+    parser.add_argument("--mic-device", default=os.getenv("MIC_DEVICE", defaults["mic_device"]))
+    parser.add_argument("--mic-format", default=os.getenv("MIC_FORMAT", defaults["mic_format"]))
+    parser.add_argument("--speaker-device", default=os.getenv("SPEAKER_DEVICE", defaults["speaker_device"]))
+    parser.add_argument("--speaker-format", default=os.getenv("SPEAKER_FORMAT", defaults["speaker_format"]))
     return parser.parse_args()
 
 
@@ -67,7 +97,7 @@ def handle_realtime_event(message: str):
 
 
 async def run():
-    """Conecta micrófono/parlante del Raspberry con OpenAI Realtime vía WebRTC."""
+    """Conecta micrófono/parlante del cliente con OpenAI Realtime vía WebRTC."""
     args = parse_args()
 
     if not args.device_token:
@@ -77,7 +107,15 @@ async def run():
     channel = pc.createDataChannel("oai-events")
     session_id = None
 
-    player = MediaPlayer(args.mic_device, format="alsa")
+    try:
+        player = MediaPlayer(args.mic_device, format=args.mic_format)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Could not open microphone {args.mic_device!r} with format {args.mic_format!r}. "
+            "On Windows use --mic-format dshow and a device like --mic-device audio=default, "
+            "or --mic-device \"audio=Microphone Name\"."
+        ) from exc
+
     recorders = []
 
     if player.audio:
@@ -89,7 +127,18 @@ async def run():
     async def on_track(track):
         print("Remote track received:", track.kind)
         if track.kind == "audio":
-            recorder = MediaRecorder(args.speaker_device, format="alsa")
+            if not args.speaker_format:
+                print("Remote audio playback is disabled; set --speaker-format to enable it.")
+                return
+
+            try:
+                recorder = MediaRecorder(args.speaker_device, format=args.speaker_format)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Could not open speaker {args.speaker_device!r} with format {args.speaker_format!r}. "
+                    "Set --speaker-format and --speaker-device for an FFmpeg output device available on this system."
+                ) from exc
+
             recorder.addTrack(track)
             await recorder.start()
             recorders.append(recorder)
