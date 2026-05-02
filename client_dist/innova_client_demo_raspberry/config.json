@@ -1,0 +1,9 @@
+{
+  "backend_url": "https://innovabackend-production-c18a.up.railway.app",
+  "child_id": 1,
+  "device_token": "innovaraspberrytoken",
+  "mic_device": null,
+  "mic_format": "alsa",
+  "speaker_device": null,
+  "speaker_rate": 48000
+}
